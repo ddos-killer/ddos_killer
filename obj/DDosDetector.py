@@ -1,19 +1,22 @@
 import asyncio
 import aiohttp
 import json
+import os
+from dotenv import load_dotenv
 from dataclasses import dataclass
 
 from .BlacklistManager import BlacklistManager
 from .Logger import logger
 
+load_dotenv()
 
 @dataclass
 class Config:
     """Configuration centralisée"""
 
-    TARGETED_SWITCH = "00:00:00:00:00:00:00:01"
-    SFLOW_RT = "http://localhost:8008"
-    FLOODLIGHT = "http://localhost:8080"
+    TARGETED_SWITCH = os.getenv("TARGETTED_SWITCH_MAC", "00:00:00:00:00:00:00:01")
+    SFLOW_RT = f"http://{os.getenv("SFLOW_RT_IP", "localhost")}:8008"
+    FLOODLIGHT = f"http://{os.getenv("FLOODLIGHT_IP", "localhost")}:8080"
     BLOCK_TIME = 360  # secondes
     FW_PRIORITY = "32767"
     POLL_INTERVAL = 3  # secondes
@@ -50,7 +53,7 @@ class DDosDetector:
                 name="ICMP Flood",
                 keys="inputifindex,ethernetprotocol,macsource,macdestination,ipprotocol,ipsource,ipdestination",
                 metric_name="icmp_flood",
-                threshold=1000,
+                threshold=100000, # 100kBps
             ),
             # Attaques SIP
             "sip_invite_flood": AttackSignature(
