@@ -72,6 +72,18 @@ class DDosDetector:
             await self.session.close()
 
     async def initialize_detection(self):
+        # Health checks
+        sflow_ok = await self._check_sflow_rt()
+        flood_ok = await self._check_floodlight()
+
+        if not sflow_ok or not flood_ok:
+            logger.error(
+                f"Initialization aborted: "
+                f"sFlow-RT={'OK' if sflow_ok else 'DOWN'}, "
+                f"Floodlight={'OK' if flood_ok else 'DOWN'}"
+            )
+            return False
+
         """Configure sFlow-RT avec les groupes et métriques"""
         try:
             # Configuration des groupes
@@ -86,9 +98,33 @@ class DDosDetector:
                     await self._configure_attack_detection(
                         self.attack_signatures[attack_type]
                     )
+            return True
 
         except Exception as e:
             logger.error(f"Initialization error: {e}")
+            return False
+
+    async def _check_sflow_rt(self) -> bool:
+        try:
+            async with self.session.get(
+                f"{self.config.SFLOW_RT}/agents/json", timeout=2
+            ) as resp:
+                return resp.status == 200
+        except Exception as e:
+            logger.error(f"sFlow-RT unreachable: {e}")
+            return False
+
+
+    async def _check_floodlight(self) -> bool:
+        try:
+            async with self.session.get(
+                f"{self.config.FLOODLIGHT}/wm/staticflowpusher/list/all/json",
+                timeout=2,
+            ) as resp:
+                return resp.status == 200
+        except Exception as e:
+            logger.error(f"Floodlight unreachable: {e}")
+            return False
 
     async def _configure_attack_detection(self, signature: AttackSignature):
         """Configure la détection pour un type d'attaque"""
@@ -250,7 +286,13 @@ class DDosDetector:
 
     async def run(self):
         """Lance le détecteur avec toutes ses tâches"""
-        await self.initialize_detection()
+        initialized = await self.initialize_detection()
+
+        if not initialized:
+            logger.error("Engine not started: infrastructure not ready")
+            return False
+        
+        logger.info("Engine started")
 
         # Lancer les tâches en parallèle
         await asyncio.gather(
