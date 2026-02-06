@@ -1,8 +1,8 @@
 import asyncio
 
-from obj.DDosDetector import Config
-from obj.DDosDetector import DDosDetector
-from obj.Logger import logger
+from ddos_killer.DDosDetector import Config
+from ddos_killer.DDosDetector import DDosDetector
+from ddos_killer.Logger import logger
 
 async def main():
     config = Config()

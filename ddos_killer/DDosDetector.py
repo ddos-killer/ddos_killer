@@ -1,30 +1,15 @@
 import asyncio
+from time import time
 import aiohttp
 import json
-import os
-from dotenv import load_dotenv
 from dataclasses import dataclass
-
+from .config import Config
 from .BlacklistManager import BlacklistManager
 from .Logger import logger
 
-load_dotenv()
 
-@dataclass
-class Config:
-    """Configuration centralisée"""
 
-    TARGETED_SWITCH = os.getenv("TARGETTED_SWITCH_MAC", "00:00:00:00:00:00:00:01")
-    SFLOW_RT = f"http://{os.getenv("SFLOW_RT_IP", "localhost")}:8008"
-    FLOODLIGHT = f"http://{os.getenv("FLOODLIGHT_IP", "localhost")}:8080"
-    BLOCK_TIME = 360  # secondes
-    FW_PRIORITY = "32767"
-    POLL_INTERVAL = 3  # secondes
-    CLEANUP_INTERVAL = 10  # secondes
 
-    GROUPS = {"external": ["0.0.0.0/0"], "internal": ["0.0.0.0/0"]}
-
-    DEFENSE = {"icmp": True, "syn": False, "dns_amplifier": False, "udp": False}
 
 
 @dataclass
@@ -44,6 +29,7 @@ class DDosDetector:
     def __init__(self, config: Config):
         self.config = config
         self.blacklist = BlacklistManager()
+        self.events = []
         self.event_id = -1
         self.session: aiohttp.ClientSession = None
 
@@ -172,6 +158,8 @@ class DDosDetector:
         """Traite un événement de détection"""
         metric_name = event.get("metric")
 
+        
+
         # Trouver la signature correspondante
         signature = next(
             (
@@ -229,6 +217,14 @@ class DDosDetector:
             "active": "true",
             "eth_type": "0x0800",
         }
+        self.events.append({
+            "timestamp": time.time(),
+            "metric": signature.metric_name,
+            "src_ip": src_ip,
+            "dst_ip": dst_ip,
+            "attack": signature.name,
+        })
+
 
         flow_data = json.dumps(flow_rule)
 
