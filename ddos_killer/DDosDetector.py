@@ -1,15 +1,12 @@
 import asyncio
-from time import time
+import ipaddress
+import time
 import aiohttp
 import json
 from dataclasses import dataclass
 from .config import Config
 from .BlacklistManager import BlacklistManager
 from .Logger import logger
-
-
-
-
 
 
 @dataclass
@@ -39,7 +36,7 @@ class DDosDetector:
                 name="ICMP Flood",
                 keys="inputifindex,ethernetprotocol,macsource,macdestination,ipprotocol,ipsource,ipdestination",
                 metric_name="icmp_flood",
-                threshold=100000, # 100kBps
+                threshold=10000, # 100kBps
             ),
             # Attaques SIP
             "sip_invite_flood": AttackSignature(
@@ -88,7 +85,7 @@ class DDosDetector:
         try:
             # Configuration des groupes
             async with self.session.put(
-                f"{self.config.SFLOW_RT}/group/lf/json", json=self.config.GROUPS
+                f"{self.config.SFLOW_RT_URL}/group/lf/json", json=self.config.GROUPS
             ) as resp:
                 logger.info(f"Groups configured: {resp.status}")
 
@@ -107,7 +104,7 @@ class DDosDetector:
     async def _check_sflow_rt(self) -> bool:
         try:
             async with self.session.get(
-                f"{self.config.SFLOW_RT}/agents/json", timeout=2
+                f"{self.config.SFLOW_RT_URL}/agents/json", timeout=2
             ) as resp:
                 return resp.status == 200
         except Exception as e:
@@ -118,7 +115,7 @@ class DDosDetector:
     async def _check_floodlight(self) -> bool:
         try:
             async with self.session.get(
-                f"{self.config.FLOODLIGHT}/wm/staticflowpusher/list/all/json",
+                f"{self.config.FLOODLIGHT_URL}/wm/staticflowpusher/list/all/json",
                 timeout=2,
             ) as resp:
                 return resp.status == 200
@@ -133,12 +130,12 @@ class DDosDetector:
 
         try:
             async with self.session.put(
-                f"{self.config.SFLOW_RT}/flow/{signature.metric_name}/json", json=flows
+                f"{self.config.SFLOW_RT_URL}/flow/{signature.metric_name}/json", json=flows
             ) as resp:
                 logger.info(f"{signature.name} flow configured: {resp.status}")
 
             async with self.session.put(
-                f"{self.config.SFLOW_RT}/threshold/{signature.metric_name}/json",
+                f"{self.config.SFLOW_RT_URL}/threshold/{signature.metric_name}/json",
                 json=threshold,
             ) as resp:
                 logger.info(f"{signature.name} threshold configured: {resp.status}")
@@ -154,7 +151,7 @@ class DDosDetector:
 
                 for flow_data, metadata in expired:
                     async with self.session.delete(
-                        f"{self.config.FLOODLIGHT}/wm/staticflowentrypusher/json",
+                        f"{self.config.FLOODLIGHT_URL}/wm/staticflowentrypusher/json",
                         data=flow_data,
                     ) as resp:
                         result = await resp.json()
@@ -171,7 +168,7 @@ class DDosDetector:
         """Polling des événements sFlow-RT"""
         while True:
             try:
-                event_url = f"{self.config.SFLOW_RT}/events/json?maxEvents=10&timeout=60&eventID={self.event_id}"
+                event_url = f"{self.config.SFLOW_RT_URL}/events/json?maxEvents=10&timeout=60&eventID={self.event_id}"
 
                 async with self.session.get(event_url) as resp:
                     events = await resp.json()
@@ -211,7 +208,7 @@ class DDosDetector:
 
         try:
             # Récupérer les métriques détaillées
-            metric_url = f"{self.config.SFLOW_RT}/metric/ALL/{event['dataSource']}.{metric_name}/json"
+            metric_url = f"{self.config.SFLOW_RT_URL}/metric/ALL/{event['dataSource']}.{metric_name}/json"
 
             async with self.session.get(metric_url) as resp:
                 metrics = await resp.json()
@@ -225,12 +222,23 @@ class DDosDetector:
                 "topKeys"
             ):
                 for top_key in metric["topKeys"]:
-                    if top_key["value"] > signature.threshold:
-                        await self._block_source(top_key["key"], signature)
-                        break  # Bloquer seulement le premier
+                    if top_key.get("value") and top_key.get("key"):
+                        if top_key["value"] > signature.threshold:
+                            await self._block_source(top_key["key"], signature)
+                            break  # Bloquer seulement le premier
 
         except Exception as e:
             logger.error(f"Error processing event: {e}")
+
+    def _is_protected_ip(self, ip: str) -> bool:
+
+        if ip in self.config.CONTROLLER_IP:
+            return True
+
+        if ip in self.config.TARGETED_SWITCH_IP:
+            return True
+
+        return False
 
     async def _block_source(self, key: str, signature: AttackSignature):
         """Bloque une source malveillante"""
@@ -239,9 +247,13 @@ class DDosDetector:
         if len(parts) < 7:
             logger.warning(f"Invalid key format: {key}")
             return
-
+    
         src_ip = parts[5]
         dst_ip = parts[6]
+
+        if self._is_protected_ip(src_ip):
+            logger.warning(f"Skipping protected IP: {src_ip}")
+            return
 
         flow_rule = {
             "switch": self.config.TARGETED_SWITCH,
@@ -266,7 +278,7 @@ class DDosDetector:
 
         try:
             async with self.session.post(
-                f"{self.config.FLOODLIGHT}/wm/staticflowentrypusher/json",
+                f"{self.config.FLOODLIGHT_URL}/wm/staticflowentrypusher/json",
                 data=flow_data,
             ) as resp:
                 result = await resp.json()
