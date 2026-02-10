@@ -254,45 +254,79 @@ class DDosDetector:
         if self._is_protected_ip(src_ip):
             logger.warning(f"Skipping protected IP: {src_ip}")
             return
-
+##################################################################################################################
+##################################################################################################################
+##################################################################################################################
+##################################################################################################################
+##################################################################################################################
+        # 🔴 RÈGLE MODIFIÉE : Bloquer uniquement ICMP Echo Request (type 8)
         flow_rule = {
             "switch": self.config.TARGETED_SWITCH,
             "name": f"{signature.metric_name}_block_{src_ip}",
-            "cookie": "0",
-            "priority": self.config.FW_PRIORITY,
+            "table": "0",                      # Table 0
+            "priority": "100",                 # Priorité 100
+            "eth_type": "0x0800",              # IPv4
+            "ipv4_src": src_ip,                # Source = h2 (10.0.0.2)
+            "ipv4_dst": dst_ip,                # Destination = h1 (10.0.0.1)
+            "ip_proto": "0x01",                # ICMP
+            "icmp_type": "8",                  # Echo Request (ping)
+            "actions": ""                      # DROP (action vide)
+        }
+    
+    # 🟢 RÈGLE COMPLÉMENTAIRE : Autoriser ICMP Echo Reply (type 0)
+        flow_rule_reply = {
+            "switch": self.config.TARGETED_SWITCH,
+            "name": f"{signature.metric_name}_allow_reply_{src_ip}",
+            "table": "0",
+            "priority": "101",                 # Priorité plus haute
+            "eth_type": "0x0800",
             "ipv4_src": src_ip,
             "ipv4_dst": dst_ip,
-            "active": "true",
-            "eth_type": "0x0800",
+            "ip_proto": "0x01",
+            "icmp_type": "0",                  # Echo Reply
+            "actions": "normal"                # Autoriser
         }
-        self.events.append({
-            "timestamp": time.time(),
-            "metric": signature.metric_name,
-            "src_ip": src_ip,
-            "dst_ip": dst_ip,
-            "attack": signature.name,
-        })
-
 
         flow_data = json.dumps(flow_rule)
+        flow_data_reply = json.dumps(flow_rule_reply)
 
         try:
+            # Bloquer Echo Request
             async with self.session.post(
                 f"{self.config.FLOODLIGHT_URL}/wm/staticflowentrypusher/json",
-                data=flow_data,
+                data =flow_data,
             ) as resp:
                 result = await resp.json()
                 logger.warning(
-                    f"🚨 BLOCKED {src_ip} -> {dst_ip} ({signature.name}): {result.get('status')}"
+                    f"🚨 BLOCKED PING {src_ip} -> {dst_ip}: {result.get('status')}"
                 )
 
-            # Ajouter à la blacklist avec métadonnées
+            # Autoriser Echo Reply
+            async with self.session.post(
+                f"{self.config.FLOODLIGHT_URL}/wm/staticflowentrypusher/json",
+                data=flow_data_reply,
+            ) as resp:
+                result_reply = await resp.json()
+                logger.info(
+                    f"✅ ALLOWED REPLY {src_ip} -> {dst_ip}: {result_reply.get('status')}"
+                )
+
+            # Ajouter les DEUX règles à la blacklist
             self.blacklist.add(
                 flow_data,
                 self.config.BLOCK_TIME,
-                {"ip": src_ip, "attack_type": signature.name},
+                {"ip": src_ip, "attack_type": signature.name, "rule_type": "block"}
             )
-
+            self.blacklist.add(
+                flow_data_reply,
+                self.config.BLOCK_TIME,
+                {"ip": src_ip, "attack_type": signature.name, "rule_type": "allow_reply"}
+            )
+##################################################################################################################
+##################################################################################################################
+##################################################################################################################
+##################################################################################################################
+##################################################################################################################
         except Exception as e:
             logger.error(f"Error blocking {src_ip}: {e}")
 
