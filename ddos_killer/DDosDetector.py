@@ -46,35 +46,17 @@ class DDosDetector:
                 keys="inputifindex,ethernetprotocol,macsource,macdestination,ipprotocol,ipsource,ipdestination",
                 metric_name="icmp_flood",
                 ip_proto="0x01",
-                threshold=30000,  # 50kBps
+                threshold=100000,  # 50kBps
                 icmpv4_type_block="8",
                 icmpv4_type_allow="0",
             ),
             # Attaques SIP
-            "sip_invite_flood": AttackSignature(
-                name="SIP INVITE Flood",
-                keys="ipsource,ipdestination,tcpdestinationport",
-                metric_name="sip_invite_flood",
+            "sip_flood": AttackSignature(
+                name="SIP Flood",
+                keys="ipsource,ipdestination,udpdestinationport",
+                metric_name="sip_flood",
                 ip_proto="0x11",
-                threshold=20,  # INVITE/sec
-                udp_dst="5060",
-                bidirectional_block=False,
-            ),
-            "sip_register_flood": AttackSignature(
-                name="SIP REGISTER Flood",
-                keys="ipsource,ipdestination",
-                metric_name="sip_register_flood",
-                ip_proto="0x11",
-                threshold=10,
-                udp_dst="5060",
-                bidirectional_block=False,
-            ),
-            "sip_options_scan": AttackSignature(
-                name="SIP OPTIONS Scan",
-                keys="ipsource",
-                metric_name="sip_options_scan",
-                ip_proto="0x11",
-                threshold=100,
+                threshold=5000,  # 50 kB/s de trafic SIP
                 udp_dst="5060",
                 bidirectional_block=False,
             ),
@@ -92,13 +74,13 @@ class DDosDetector:
     async def initialize_detection(self):
         # Health checks
         sflow_ok = await self._check_sflow_rt()
-        flood_ok = await self._check_floodlight()
+        ryu_ok = await self._check_ryu()
 
-        if not sflow_ok or not flood_ok:
+        if not sflow_ok or not ryu_ok:
             logger.error(
                 f"Initialization aborted: "
                 f"sFlow-RT={'OK' if sflow_ok else 'DOWN'}, "
-                f"Floodlight={'OK' if flood_ok else 'DOWN'}"
+                f"Ryu={'OK' if ryu_ok else 'DOWN'}"
             )
             return False
 
@@ -133,10 +115,10 @@ class DDosDetector:
             logger.error(f"sFlow-RT unreachable: {e}")
             return False
 
-    async def _check_floodlight(self) -> bool:
+    async def _check_ryu(self) -> bool:
         try:
             async with self.session.get(
-                f"{self.config.FLOODLIGHT_URL}/wm/staticflowpusher/list/all/json",
+                f"{self.config.RYU_URL}/stats/switches",
                 timeout=2,
             ) as resp:
                 return resp.status == 200
@@ -171,23 +153,17 @@ class DDosDetector:
             try:
                 expired = self.blacklist.get_expired()
 
-                for flow_data, metadata in expired:
-                    flow_rule = json.loads(flow_data)
-                    flow_name = flow_rule["name"]
+                for flow_name, switch_id, match in expired:
+                    delete_data = {"dpid": int(switch_id), "match": match}
 
-                    delete_data = {
-                        "name": flow_name,
-                        "switch": self.config.TARGETED_SWITCH,  # ← Important !
-                    }
-
-                    async with self.session.delete(
-                        f"{self.config.FLOODLIGHT_URL}/wm/staticflowentrypusher/json",
+                    async with self.session.post(
+                        f"{self.config.RYU_URL}/stats/flowentry/delete",
                         json=delete_data,
-                        headers={'Content-Type': 'application/json'}
+                        headers={"Content-Type": "application/json"},
                     ) as resp:
-                        result = await resp.json()
+                        result = await resp.text()
                         logger.info(
-                            f"Unblocked {metadata.get('ip', 'unknown')}: {result.get('status')}"
+                            f"Unblocked rule {flow_name} (IP: {match.get('ipv4_src', 'unknown')}): {resp.status}"
                         )
 
             except Exception as e:
@@ -273,130 +249,136 @@ class DDosDetector:
         """Construit les règles block + allow"""
 
         block_rule = {
-            "switch": self.config.TARGETED_SWITCH,
-            "name": f"{signature.metric_name}_block_{src_ip}_{dst_ip}",
+            "dpid": self.config.TARGETED_SWITCH,
             "priority": self.config.FW_PRIORITY,
-            "ip_proto": signature.ip_proto,
-            "active": "true",
-            "eth_type": "0x0800"
+            "match": {
+                "eth_type": 0x0800,
+                "ip_proto": signature.ip_proto,
+            },
+            "actions": [],
         }
 
         allow_rule = {
-            "switch": self.config.TARGETED_SWITCH,
-            "name": f"{signature.metric_name}_allow_{dst_ip}_{src_ip}",
+            "dpid": self.config.TARGETED_SWITCH,
             "priority": int(self.config.FW_PRIORITY) + 1,
-            "ip_proto": signature.ip_proto,
-            "active": "true",
-            "eth_type": "0x0800",
-            "actions": "output=normal",
+            "match": {
+                "ip_proto": signature.ip_proto,
+                "eth_type": 0x0800,
+            },
+            "actions": [
+                {
+                    "type": "OUTPUT",
+                    "port": "NORMAL",  # Ou port number
+                }
+            ],
         }
 
         # Ajouter les champs optionnels s'ils existent
         if signature.ip_proto == "0x01":
             if signature.icmpv4_type_block:
-                block_rule["icmpv4_type"] = signature.icmpv4_type_block
-                block_rule["ipv4_src"] = src_ip
-                block_rule["ipv4_dst"] = dst_ip
-                allow_rule["ipv4_src"] = src_ip
-                allow_rule["ipv4_dst"] = dst_ip
+                block_rule["match"]["icmpv4_type"] = signature.icmpv4_type_block
+                block_rule["match"]["ipv4_src"] = src_ip
+                block_rule["match"]["ipv4_dst"] = dst_ip
+                allow_rule["match"]["ipv4_src"] = src_ip
+                allow_rule["match"]["ipv4_dst"] = dst_ip
             if signature.icmpv4_type_allow:
-                allow_rule["icmpv4_type"] = signature.icmpv4_type_allow
+                allow_rule["match"]["icmpv4_type"] = signature.icmpv4_type_allow
         elif signature.ip_proto == "0x11" and signature.udp_dst:
-            block_rule["udp_dst"] = signature.udp_dst
-            allow_rule["udp_src"] = signature.udp_dst
-            block_rule["ipv4_src"] = src_ip
-            block_rule["ipv4_dst"] = dst_ip
-            allow_rule["ipv4_src"] = dst_ip
-            allow_rule["ipv4_dst"] = src_ip
+            block_rule["match"]["udp_dst"] = signature.udp_dst
+            allow_rule["match"]["udp_src"] = signature.udp_dst
+            block_rule["match"]["ipv4_src"] = src_ip
+            block_rule["match"]["ipv4_dst"] = dst_ip
+            allow_rule["match"]["ipv4_src"] = dst_ip
+            allow_rule["match"]["ipv4_dst"] = src_ip
         else:
             allow_rule = None
-            block_rule["ipv4_src"] = src_ip
-            block_rule["ipv4_dst"] = dst_ip
-        if signature.tcp_flags:
-            block_rule["tcp_flags"] = signature.tcp_flags
+            block_rule["match"]["ipv4_src"] = src_ip
+            block_rule["match"]["ipv4_dst"] = dst_ip
+        # if signature.tcp_flags:
+        #     block_rule["match"]["tcp_flags"] = signature.tcp_flags
 
         return block_rule, allow_rule
-    
+
     async def add_default_forwarding_rule(self):
         """Règles par défaut pour le forwarding normal"""
-        
+
         # Règle 1 : Forwarding L2 normal (apprend les MAC)
         l2_forward = {
-            "switch": self.config.TARGETED_SWITCH,
-            "name": "default_l2_forward",
+            "dpid": self.config.TARGETED_SWITCH,
             "priority": "10",  # Entre 1 (CONTROLLER) et 1000 (tes règles)
-            "active": "true",
-            "actions": "output=normal"  # Learning switch behavior
+            "match": {},
+            "actions": [
+                {"type": "OUTPUT", "port": "NORMAL"}
+            ],  # Learning switch behavior
         }
-        
+
         # Règle 2 : Autoriser explicitement ARP
         arp_allow = {
-            "switch": self.config.TARGETED_SWITCH,
-            "name": "allow_arp",
+            "dpid": self.config.TARGETED_SWITCH,
             "priority": "100",
-            "eth_type": "0x0806",  # ARP
-            "active": "true",
-            "actions": "output=normal"
+            "match": {
+                "eth_type": 0x0806,  # ARP
+            },
+            "actions": [{"type": "OUTPUT", "port": "NORMAL"}],
         }
-        
+
         # Règle 3 : Autoriser le trafic sFlow (UDP 6343)
         sflow_allow = {
-            "switch": self.config.TARGETED_SWITCH,
-            "name": "allow_sflow",
+            "dpid": self.config.TARGETED_SWITCH,
             "priority": "100",
-            "eth_type": "0x0800",
-            "ip_proto": "0x11",  # UDP
-            "udp_dst": "6343",   # Port sFlow
-            "active": "true",
-            "actions": "output=normal"
+            "match": {
+                "eth_type": 0x0800,
+                "ip_proto": 17,  # UDP
+                "udp_dst": 6343,  # Port sFlow
+            },
+            "actions": [{"type": "OUTPUT", "port": "NORMAL"}],
         }
-        
+
         # Règle 4 : Autoriser le trafic de contrôle OpenFlow
         openflow_allow = {
-            "switch": self.config.TARGETED_SWITCH,
-            "name": "allow_openflow",
+            "dpid": self.config.TARGETED_SWITCH,
             "priority": "200",
-            "eth_type": "0x0800",
-            "ip_proto": "0x06",  # TCP
-            "tcp_dst": "6653",   # Port OpenFlow
-            "active": "true",
-            "actions": "output=normal"
+            "match": {
+                "eth_type": 0x0800,
+                "ip_proto": 6,  # TCP
+                "tcp_dst": 6653,  # Port OpenFlow
+            },
+            "actions": [{"type": "OUTPUT", "port": "NORMAL"}],
         }
-        
+
         for rule in [l2_forward, arp_allow, sflow_allow, openflow_allow]:
             try:
                 async with self.session.post(
-                    f'{self.config.FLOODLIGHT_URL}/wm/staticflowentrypusher/json',
+                    f"{self.config.RYU_URL}/stats/flowentry/add",
                     json=rule,
-                    headers={'Content-Type': 'application/json'}
+                    headers={"Content-Type": "application/json"},
                 ) as resp:
-                    result = await resp.json()
+                    result = await resp.text()
                     logger.info(
-                        f"✅ Infrastructure rule '{rule['name']}': "
-                        f"{result.get('status')}"
+                        f"✅ Infrastructure rule (Priority {rule['priority']}): "
+                        f"{result}"
                     )
             except Exception as e:
-                logger.error(f"Error installing {rule['name']}: {e}")
+                logger.error(f"Error installing (Priority {rule['priority']}): {e}")
 
     async def _block_source(self, key: str, signature: AttackSignature):
         """Bloque une source malveillante"""
         parts = key.split(",")
 
-        if len(parts) < 7:
-            logger.warning(f"Invalid key format: {key}")
-            return
+        keys_list = signature.keys.split(',')
+        key_values = {}
+        for i, key_name in enumerate(keys_list):
+            if i < len(parts):
+                key_values[key_name] = parts[i]
 
-        src_ip = parts[5]
-        dst_ip = parts[6]
+        src_ip = key_values.get('ipsource')
+        dst_ip = key_values.get('ipdestination')
 
         if self._is_protected_ip(src_ip):
             logger.warning(f"Skipping protected IP: {src_ip}")
             return
 
         block_rule, allow_rule = self.build_rules(signature, src_ip, dst_ip)
-
-        logger.info(block_rule)
-        logger.info(allow_rule)
 
         self.events.append(
             {
@@ -410,36 +392,38 @@ class DDosDetector:
 
         try:
             async with self.session.post(
-                f"{self.config.FLOODLIGHT_URL}/wm/staticflowentrypusher/json",
+                f"{self.config.RYU_URL}/stats/flowentry/add",
                 data=json.dumps(block_rule),
             ) as resp:
-                result = await resp.json()
+                result = await resp.text()
                 logger.warning(
-                    f"🚨 BLOCKED {src_ip} -> {dst_ip} ({signature.name}): {result.get('status')}"
+                    f"🚨 BLOCKED {src_ip} -> {dst_ip} ({signature.name}): {resp.status}"
                 )
 
             # Ajouter à la blacklist avec métadonnées
             self.blacklist.add(
-                json.dumps(block_rule),
-                self.config.BLOCK_TIME,
-                {"ip": src_ip, "attack_type": signature.name},
+                flow_name=f"{signature.metric_name}_block_{dst_ip}_{src_ip}",
+                switch_id=str(self.config.TARGETED_SWITCH),
+                block_duration=self.config.BLOCK_TIME,
+                match=block_rule["match"],
             )
 
             if allow_rule:
                 async with self.session.post(
-                    f"{self.config.FLOODLIGHT_URL}/wm/staticflowentrypusher/json",
+                    f"{self.config.RYU_URL}/stats/flowentry/add",
                     data=json.dumps(allow_rule),
                 ) as resp:
-                    result = await resp.json()
+                    result = await resp.text()
                     logger.info(
-                        f"✅ ALLOWED {allow_rule['ipv4_dst']} -> {allow_rule['ipv4_src']} ({signature.name}): {result.get('status')}"
+                        f"✅ ALLOWED {allow_rule['match']['ipv4_dst']} -> {allow_rule['match']['ipv4_src']} ({signature.name}): {resp.status}"
                     )
 
                 # Ajouter à la blacklist avec métadonnées
                 self.blacklist.add(
-                    json.dumps(allow_rule),
-                    self.config.BLOCK_TIME,
-                    {"ip": src_ip, "attack_type": signature.name},
+                    flow_name=f"{signature.metric_name}_allow_{dst_ip}_{src_ip}",
+                    switch_id=str(self.config.TARGETED_SWITCH),
+                    block_duration=self.config.BLOCK_TIME,
+                    match=allow_rule["match"],
                 )
 
         except Exception as e:
