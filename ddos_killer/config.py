@@ -14,8 +14,8 @@ class Config:
     FLOODLIGHT_IP = os.getenv('FLOODLIGHT_IP', 'localhost')
     CONTROLLER_IP = os.getenv('CONTROLLER', 'localhost')
     PROTECTED_SUBNET = os.getenv('PROTECTED_SUBNET')
-    BLOCK_TIME = 360
-    FW_PRIORITY = "32767"
+    BLOCK_TIME = 120
+    FW_PRIORITY = 1000
     POLL_INTERVAL = 3
     CLEANUP_INTERVAL = 10
 

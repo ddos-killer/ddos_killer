@@ -1,5 +1,4 @@
 import asyncio
-import ipaddress
 import time
 import aiohttp
 import json
@@ -17,7 +16,17 @@ class AttackSignature:
     keys: str
     metric_name: str
     threshold: int
+    ip_proto: str
     value_type: str = "bytes"
+
+    # Champs optionnels spécifiques au protocole
+    icmpv4_type_block: str = None  # Type ICMP à bloquer
+    icmpv4_type_allow: str = None  # Type ICMP à autoriser
+    udp_src: str = None
+    udp_dst: str = None
+    tcp_flags: str = None
+
+    bidirectional_block: bool = False
 
 
 class DDosDetector:
@@ -36,26 +45,38 @@ class DDosDetector:
                 name="ICMP Flood",
                 keys="inputifindex,ethernetprotocol,macsource,macdestination,ipprotocol,ipsource,ipdestination",
                 metric_name="icmp_flood",
-                threshold=10000, # 100kBps
+                ip_proto="0x01",
+                threshold=30000,  # 50kBps
+                icmpv4_type_block="8",
+                icmpv4_type_allow="0",
             ),
             # Attaques SIP
             "sip_invite_flood": AttackSignature(
                 name="SIP INVITE Flood",
                 keys="ipsource,ipdestination,tcpdestinationport",
                 metric_name="sip_invite_flood",
+                ip_proto="0x11",
                 threshold=20,  # INVITE/sec
+                udp_dst="5060",
+                bidirectional_block=False,
             ),
             "sip_register_flood": AttackSignature(
                 name="SIP REGISTER Flood",
                 keys="ipsource,ipdestination",
                 metric_name="sip_register_flood",
+                ip_proto="0x11",
                 threshold=10,
+                udp_dst="5060",
+                bidirectional_block=False,
             ),
             "sip_options_scan": AttackSignature(
                 name="SIP OPTIONS Scan",
                 keys="ipsource",
                 metric_name="sip_options_scan",
+                ip_proto="0x11",
                 threshold=100,
+                udp_dst="5060",
+                bidirectional_block=False,
             ),
         }
 
@@ -83,6 +104,7 @@ class DDosDetector:
 
         """Configure sFlow-RT avec les groupes et métriques"""
         try:
+            await self.add_default_forwarding_rule()
             # Configuration des groupes
             async with self.session.put(
                 f"{self.config.SFLOW_RT_URL}/group/lf/json", json=self.config.GROUPS
@@ -111,7 +133,6 @@ class DDosDetector:
             logger.error(f"sFlow-RT unreachable: {e}")
             return False
 
-
     async def _check_floodlight(self) -> bool:
         try:
             async with self.session.get(
@@ -130,7 +151,8 @@ class DDosDetector:
 
         try:
             async with self.session.put(
-                f"{self.config.SFLOW_RT_URL}/flow/{signature.metric_name}/json", json=flows
+                f"{self.config.SFLOW_RT_URL}/flow/{signature.metric_name}/json",
+                json=flows,
             ) as resp:
                 logger.info(f"{signature.name} flow configured: {resp.status}")
 
@@ -150,9 +172,18 @@ class DDosDetector:
                 expired = self.blacklist.get_expired()
 
                 for flow_data, metadata in expired:
+                    flow_rule = json.loads(flow_data)
+                    flow_name = flow_rule["name"]
+
+                    delete_data = {
+                        "name": flow_name,
+                        "switch": self.config.TARGETED_SWITCH,  # ← Important !
+                    }
+
                     async with self.session.delete(
                         f"{self.config.FLOODLIGHT_URL}/wm/staticflowentrypusher/json",
-                        data=flow_data,
+                        json=delete_data,
+                        headers={'Content-Type': 'application/json'}
                     ) as resp:
                         result = await resp.json()
                         logger.info(
@@ -190,8 +221,6 @@ class DDosDetector:
     async def _process_event(self, event: dict):
         """Traite un événement de détection"""
         metric_name = event.get("metric")
-
-        
 
         # Trouver la signature correspondante
         signature = next(
@@ -240,6 +269,115 @@ class DDosDetector:
 
         return False
 
+    def build_rules(self, signature: AttackSignature, src_ip: str, dst_ip: str):
+        """Construit les règles block + allow"""
+
+        block_rule = {
+            "switch": self.config.TARGETED_SWITCH,
+            "name": f"{signature.metric_name}_block_{src_ip}_{dst_ip}",
+            "priority": self.config.FW_PRIORITY,
+            "ip_proto": signature.ip_proto,
+            "active": "true",
+            "eth_type": "0x0800"
+        }
+
+        allow_rule = {
+            "switch": self.config.TARGETED_SWITCH,
+            "name": f"{signature.metric_name}_allow_{dst_ip}_{src_ip}",
+            "priority": int(self.config.FW_PRIORITY) + 1,
+            "ip_proto": signature.ip_proto,
+            "active": "true",
+            "eth_type": "0x0800",
+            "actions": "output=normal",
+        }
+
+        # Ajouter les champs optionnels s'ils existent
+        if signature.ip_proto == "0x01":
+            if signature.icmpv4_type_block:
+                block_rule["icmpv4_type"] = signature.icmpv4_type_block
+                block_rule["ipv4_src"] = src_ip
+                block_rule["ipv4_dst"] = dst_ip
+                allow_rule["ipv4_src"] = src_ip
+                allow_rule["ipv4_dst"] = dst_ip
+            if signature.icmpv4_type_allow:
+                allow_rule["icmpv4_type"] = signature.icmpv4_type_allow
+        elif signature.ip_proto == "0x11" and signature.udp_dst:
+            block_rule["udp_dst"] = signature.udp_dst
+            allow_rule["udp_src"] = signature.udp_dst
+            block_rule["ipv4_src"] = src_ip
+            block_rule["ipv4_dst"] = dst_ip
+            allow_rule["ipv4_src"] = dst_ip
+            allow_rule["ipv4_dst"] = src_ip
+        else:
+            allow_rule = None
+            block_rule["ipv4_src"] = src_ip
+            block_rule["ipv4_dst"] = dst_ip
+        if signature.tcp_flags:
+            block_rule["tcp_flags"] = signature.tcp_flags
+
+        return block_rule, allow_rule
+    
+    async def add_default_forwarding_rule(self):
+        """Règles par défaut pour le forwarding normal"""
+        
+        # Règle 1 : Forwarding L2 normal (apprend les MAC)
+        l2_forward = {
+            "switch": self.config.TARGETED_SWITCH,
+            "name": "default_l2_forward",
+            "priority": "10",  # Entre 1 (CONTROLLER) et 1000 (tes règles)
+            "active": "true",
+            "actions": "output=normal"  # Learning switch behavior
+        }
+        
+        # Règle 2 : Autoriser explicitement ARP
+        arp_allow = {
+            "switch": self.config.TARGETED_SWITCH,
+            "name": "allow_arp",
+            "priority": "100",
+            "eth_type": "0x0806",  # ARP
+            "active": "true",
+            "actions": "output=normal"
+        }
+        
+        # Règle 3 : Autoriser le trafic sFlow (UDP 6343)
+        sflow_allow = {
+            "switch": self.config.TARGETED_SWITCH,
+            "name": "allow_sflow",
+            "priority": "100",
+            "eth_type": "0x0800",
+            "ip_proto": "0x11",  # UDP
+            "udp_dst": "6343",   # Port sFlow
+            "active": "true",
+            "actions": "output=normal"
+        }
+        
+        # Règle 4 : Autoriser le trafic de contrôle OpenFlow
+        openflow_allow = {
+            "switch": self.config.TARGETED_SWITCH,
+            "name": "allow_openflow",
+            "priority": "200",
+            "eth_type": "0x0800",
+            "ip_proto": "0x06",  # TCP
+            "tcp_dst": "6653",   # Port OpenFlow
+            "active": "true",
+            "actions": "output=normal"
+        }
+        
+        for rule in [l2_forward, arp_allow, sflow_allow, openflow_allow]:
+            try:
+                async with self.session.post(
+                    f'{self.config.FLOODLIGHT_URL}/wm/staticflowentrypusher/json',
+                    json=rule,
+                    headers={'Content-Type': 'application/json'}
+                ) as resp:
+                    result = await resp.json()
+                    logger.info(
+                        f"✅ Infrastructure rule '{rule['name']}': "
+                        f"{result.get('status')}"
+                    )
+            except Exception as e:
+                logger.error(f"Error installing {rule['name']}: {e}")
+
     async def _block_source(self, key: str, signature: AttackSignature):
         """Bloque une source malveillante"""
         parts = key.split(",")
@@ -247,7 +385,7 @@ class DDosDetector:
         if len(parts) < 7:
             logger.warning(f"Invalid key format: {key}")
             return
-    
+
         src_ip = parts[5]
         dst_ip = parts[6]
 
@@ -255,31 +393,25 @@ class DDosDetector:
             logger.warning(f"Skipping protected IP: {src_ip}")
             return
 
-        flow_rule = {
-            "switch": self.config.TARGETED_SWITCH,
-            "name": f"{signature.metric_name}_block_{src_ip}",
-            "cookie": "0",
-            "priority": self.config.FW_PRIORITY,
-            "ipv4_src": src_ip,
-            "ipv4_dst": dst_ip,
-            "active": "true",
-            "eth_type": "0x0800",
-        }
-        self.events.append({
-            "timestamp": time.time(),
-            "metric": signature.metric_name,
-            "src_ip": src_ip,
-            "dst_ip": dst_ip,
-            "attack": signature.name,
-        })
+        block_rule, allow_rule = self.build_rules(signature, src_ip, dst_ip)
 
+        logger.info(block_rule)
+        logger.info(allow_rule)
 
-        flow_data = json.dumps(flow_rule)
+        self.events.append(
+            {
+                "timestamp": time.time(),
+                "metric": signature.metric_name,
+                "src_ip": src_ip,
+                "dst_ip": dst_ip,
+                "attack": signature.name,
+            }
+        )
 
         try:
             async with self.session.post(
                 f"{self.config.FLOODLIGHT_URL}/wm/staticflowentrypusher/json",
-                data=flow_data,
+                data=json.dumps(block_rule),
             ) as resp:
                 result = await resp.json()
                 logger.warning(
@@ -288,10 +420,27 @@ class DDosDetector:
 
             # Ajouter à la blacklist avec métadonnées
             self.blacklist.add(
-                flow_data,
+                json.dumps(block_rule),
                 self.config.BLOCK_TIME,
                 {"ip": src_ip, "attack_type": signature.name},
             )
+
+            if allow_rule:
+                async with self.session.post(
+                    f"{self.config.FLOODLIGHT_URL}/wm/staticflowentrypusher/json",
+                    data=json.dumps(allow_rule),
+                ) as resp:
+                    result = await resp.json()
+                    logger.info(
+                        f"✅ ALLOWED {allow_rule['ipv4_dst']} -> {allow_rule['ipv4_src']} ({signature.name}): {result.get('status')}"
+                    )
+
+                # Ajouter à la blacklist avec métadonnées
+                self.blacklist.add(
+                    json.dumps(allow_rule),
+                    self.config.BLOCK_TIME,
+                    {"ip": src_ip, "attack_type": signature.name},
+                )
 
         except Exception as e:
             logger.error(f"Error blocking {src_ip}: {e}")
@@ -303,7 +452,7 @@ class DDosDetector:
         if not initialized:
             logger.error("Engine not started: infrastructure not ready")
             return False
-        
+
         logger.info("Engine started")
 
         # Lancer les tâches en parallèle
