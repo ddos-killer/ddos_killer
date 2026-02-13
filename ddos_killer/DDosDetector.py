@@ -56,7 +56,7 @@ class DDosDetector:
                 keys="ipsource,ipdestination,udpdestinationport",
                 metric_name="sip_flood",
                 ip_proto="0x11",
-                threshold=50000,  # 50 kB/s de trafic SIP
+                threshold=7500,  # 50 kB/s de trafic SIP
                 udp_dst="5060",
                 bidirectional_block=False,
             ),
@@ -478,8 +478,12 @@ class DDosDetector:
                     data=json.dumps(allow_rule),
                 ) as resp:
                     result = await resp.text()
-                    src = allow_rule['match']['ipv4_src'] if allow_rule['match']['icmpv4_type'] == '8' else allow_rule['match']['ipv4_dst']
-                    dst = allow_rule['match']['ipv4_dst'] if allow_rule['match']['icmpv4_type'] == '8' else allow_rule['match']['ipv4_src']
+                    src = allow_rule['match']['ipv4_src']
+                    dst = allow_rule['match']['ipv4_dst']
+                    if signature.name == "ICMP Flood":
+                        allow_rule['match']['ipv4_dst'] 
+                        allow_rule['match']['ipv4_src']
+                        
                     logger.info(
                         f"✅ ALLOWED {src} -> {dst} ({signature.name}): {resp.status}"
                     )
