@@ -46,7 +46,7 @@ class DDosDetector:
                 keys="inputifindex,ethernetprotocol,macsource,macdestination,ipprotocol,ipsource,ipdestination",
                 metric_name="icmp_flood",
                 ip_proto="0x01",
-                threshold=100000,  # 50kBps
+                threshold=30000,  # 30kBps
                 icmpv4_type_block="8",
                 icmpv4_type_allow="0",
             ),
@@ -56,7 +56,7 @@ class DDosDetector:
                 keys="ipsource,ipdestination,udpdestinationport",
                 metric_name="sip_flood",
                 ip_proto="0x11",
-                threshold=5000,  # 50 kB/s de trafic SIP
+                threshold=50000,  # 50 kB/s de trafic SIP
                 udp_dst="5060",
                 bidirectional_block=False,
             ),
@@ -131,7 +131,16 @@ class DDosDetector:
         flows = {"keys": signature.keys, "value": signature.value_type}
         threshold = {"metric": signature.metric_name, "value": signature.threshold}
 
+        # FILTRE POUR ICMP TYPE 8
+        if signature.ip_proto == "0x01" and signature.icmpv4_type_block:
+            flows['filter'] = f'icmptype={signature.icmpv4_type_block}'
+        
+        # Filtre pour SIP
+        elif signature.udp_dst:
+            flows['filter'] = f'udpdestinationport={signature.udp_dst}'
+
         try:
+            logger.info(f"Configuring {signature.name}")
             async with self.session.put(
                 f"{self.config.SFLOW_RT_URL}/flow/{signature.metric_name}/json",
                 json=flows,
@@ -151,9 +160,15 @@ class DDosDetector:
         """Nettoie périodiquement les règles expirées"""
         while True:
             try:
+                blacklist_size_before = len(self.blacklist)
+                logger.debug(f"🧹 Cleanup check... (blacklist: {blacklist_size_before} entries)")
+                
                 expired = self.blacklist.get_expired()
 
-                for flow_name, switch_id, match in expired:
+                if expired:
+                    logger.info(f"♻️ Cleaning {len(expired)} expired rule(s)")
+
+                for flow_name, switch_id, match, src_ip, dst_ip in expired:
                     delete_data = {"dpid": int(switch_id), "match": match}
 
                     async with self.session.post(
@@ -162,37 +177,79 @@ class DDosDetector:
                         headers={"Content-Type": "application/json"},
                     ) as resp:
                         result = await resp.text()
-                        logger.info(
-                            f"Unblocked rule {flow_name} (IP: {match.get('ipv4_src', 'unknown')}): {resp.status}"
-                        )
+                        
+                        if resp.status == 200:
+                            logger.info(f"✅ Unblocked {flow_name} ({src_ip}→{dst_ip})")
+                        else:
+                            logger.error(f"❌ Failed: {resp.status} - {result}")
 
             except Exception as e:
-                logger.error(f"Cleanup error: {e}")
+                logger.error(f"Cleanup error: {e}", exc_info=True)
 
             await asyncio.sleep(self.config.CLEANUP_INTERVAL)
 
     async def poll_events(self):
         """Polling des événements sFlow-RT"""
+        last_check = time.time()
+        
         while True:
             try:
-                event_url = f"{self.config.SFLOW_RT_URL}/events/json?maxEvents=10&timeout=60&eventID={self.event_id}"
-
+                event_url = f'{self.config.SFLOW_RT_URL}/events/json?maxEvents=10&timeout=60&eventID={self.event_id}'
+                
                 async with self.session.get(event_url) as resp:
                     events = await resp.json()
-
+                
                 if events:
                     self.event_id = events[0]["eventID"]
                     events.reverse()
-
+                    
+                    logger.info(f"📬 Received {len(events)} event(s)")
                     for event in events:
+                        logger.warning(f"🔔 Event: {event.get('metric')}")
                         await self._process_event(event)
-
+                
+                # ← POLLING ACTIF : vérifier les métriques régulièrement
+                # même sans events
+                now = time.time()
+                if now - last_check > 10:  # Toutes les 10 secondes
+                    await self._check_active_attacks()
+                    last_check = now
+            
             except asyncio.TimeoutError:
-                logger.warning("Event polling timeout")
+                logger.debug("Event polling timeout (normal)")
             except Exception as e:
                 logger.error(f"Event polling error: {e}")
-
+            
             await asyncio.sleep(self.config.POLL_INTERVAL)
+
+    async def _check_active_attacks(self):
+        """Vérification proactive des attaques actives"""
+        logger.debug("🔍 Proactive attack check...")
+        
+        for signature in self.attack_signatures.values():
+            try:
+                # Récupérer les métriques actuelles
+                async with self.session.get(
+                    f'{self.config.SFLOW_RT_URL}/metric/ALL/{signature.metric_name}/json'
+                ) as resp:
+                    metrics = await resp.json()
+                
+                for metric in metrics:
+                    if metric.get('metricValue', 0) > signature.threshold:
+                        logger.warning(
+                            f"⚠️ Active attack detected: {signature.name} "
+                            f"({metric.get('metricValue')} > {signature.threshold})"
+                        )
+                        
+                        # Traiter comme un event
+                        if metric.get('topKeys'):
+                            for top_key in metric['topKeys']:
+                                if top_key['value'] > signature.threshold:
+                                    await self._block_source(top_key['key'], signature)
+                                    break
+            
+            except Exception as e:
+                logger.debug(f"Check error for {signature.name}: {e}")
 
     async def _process_event(self, event: dict):
         """Traite un événement de détection"""
@@ -377,6 +434,10 @@ class DDosDetector:
         if self._is_protected_ip(src_ip):
             logger.warning(f"Skipping protected IP: {src_ip}")
             return
+        
+        if self.blacklist.is_blocked(src_ip, dst_ip, signature.metric_name):
+            logger.info(f"✋ {src_ip} ↔ {dst_ip} already blocked for {signature.name}")
+            return
 
         block_rule, allow_rule = self.build_rules(signature, src_ip, dst_ip)
 
@@ -402,10 +463,13 @@ class DDosDetector:
 
             # Ajouter à la blacklist avec métadonnées
             self.blacklist.add(
-                flow_name=f"{signature.metric_name}_block_{dst_ip}_{src_ip}",
+                flow_name=f"{signature.metric_name}_block_{src_ip}_{dst_ip}",
                 switch_id=str(self.config.TARGETED_SWITCH),
                 block_duration=self.config.BLOCK_TIME,
                 match=block_rule["match"],
+                src_ip=src_ip,
+                dst_ip=dst_ip,
+                metric_name=signature.metric_name
             )
 
             if allow_rule:
@@ -414,8 +478,10 @@ class DDosDetector:
                     data=json.dumps(allow_rule),
                 ) as resp:
                     result = await resp.text()
+                    src = allow_rule['match']['ipv4_src'] if allow_rule['match']['icmpv4_type'] == '8' else allow_rule['match']['ipv4_dst']
+                    dst = allow_rule['match']['ipv4_dst'] if allow_rule['match']['icmpv4_type'] == '8' else allow_rule['match']['ipv4_src']
                     logger.info(
-                        f"✅ ALLOWED {allow_rule['match']['ipv4_dst']} -> {allow_rule['match']['ipv4_src']} ({signature.name}): {resp.status}"
+                        f"✅ ALLOWED {src} -> {dst} ({signature.name}): {resp.status}"
                     )
 
                 # Ajouter à la blacklist avec métadonnées
@@ -424,6 +490,9 @@ class DDosDetector:
                     switch_id=str(self.config.TARGETED_SWITCH),
                     block_duration=self.config.BLOCK_TIME,
                     match=allow_rule["match"],
+                    src_ip=dst_ip,
+                    dst_ip=src_ip,
+                    metric_name=signature.metric_name
                 )
 
         except Exception as e:
