@@ -62,6 +62,15 @@ class DDosDetector:
             ),
         }
 
+    async def set_threshold(self, attack_type: str, threshold: int): 
+        if self.attack_signatures[attack_type]:
+            self.attack_signatures[attack_type].threshold = threshold
+            await self._configure_attack_detection(self.attack_signatures[attack_type])
+        else:
+            return False
+        
+        return True
+
     async def __aenter__(self):
         """Context manager pour gérer la session HTTP"""
         self.session = aiohttp.ClientSession()
