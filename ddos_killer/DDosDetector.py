@@ -7,7 +7,7 @@ from .config import Config
 from .BlacklistManager import BlacklistManager
 from .Logger import logger
 
-
+# Classe de typage des attaques
 @dataclass
 class AttackSignature:
     """Signature d'une attaque"""
@@ -16,10 +16,10 @@ class AttackSignature:
     keys: str
     metric_name: str
     threshold: int
-    ip_proto: str
+    ip_proto: int
     value_type: str = "bytes"
 
-    # Champs optionnels spécifiques au protocole
+    # Champs spécifiques au protocole
     icmpv4_type_block: str = None  # Type ICMP à bloquer
     icmpv4_type_allow: str = None  # Type ICMP à autoriser
     udp_src: str = None
@@ -39,13 +39,13 @@ class DDosDetector:
         self.event_id = -1
         self.session: aiohttp.ClientSession = None
 
-        # Définir les signatures d'attaques
+        # Définition des signatures d'attaques
         self.attack_signatures = {
             "icmp": AttackSignature(
                 name="ICMP Flood",
                 keys="inputifindex,ethernetprotocol,macsource,macdestination,ipprotocol,ipsource,ipdestination",
                 metric_name="icmp_flood",
-                ip_proto="0x01",
+                ip_proto=1,
                 threshold=30000,  # 30kBps
                 icmpv4_type_block="8",
                 icmpv4_type_allow="0",
@@ -55,13 +55,14 @@ class DDosDetector:
                 name="SIP Flood",
                 keys="ipsource,ipdestination,udpdestinationport",
                 metric_name="sip_flood",
-                ip_proto="0x11",
-                threshold=7500,  # 50 kB/s de trafic SIP
+                ip_proto=17,
+                threshold=30000,  # 50 kB/s de trafic SIP
                 udp_dst="5060",
                 bidirectional_block=False,
             ),
         }
 
+    # Fonction de mofidication des seuils de détection
     async def set_threshold(self, attack_type: str, threshold: int): 
         if self.attack_signatures[attack_type]:
             self.attack_signatures[attack_type].threshold = threshold
@@ -80,6 +81,7 @@ class DDosDetector:
         if self.session:
             await self.session.close()
 
+    # Vérification de l'infrastructure (Ryu + sFlow-RT) et envoi des types de détection voulus à sFlow-RT 
     async def initialize_detection(self):
         # Health checks
         sflow_ok = await self._check_sflow_rt()
@@ -114,6 +116,7 @@ class DDosDetector:
             logger.error(f"Initialization error: {e}")
             return False
 
+    # Vérification que sFlow-RT fonctionne bien
     async def _check_sflow_rt(self) -> bool:
         try:
             async with self.session.get(
@@ -124,6 +127,7 @@ class DDosDetector:
             logger.error(f"sFlow-RT unreachable: {e}")
             return False
 
+    # Vérification que Ryu fonctionne bien
     async def _check_ryu(self) -> bool:
         try:
             async with self.session.get(
@@ -135,13 +139,14 @@ class DDosDetector:
             logger.error(f"Floodlight unreachable: {e}")
             return False
 
+    # Envoi des données spécifiques de détection à sFlow-RT 
     async def _configure_attack_detection(self, signature: AttackSignature):
         """Configure la détection pour un type d'attaque"""
         flows = {"keys": signature.keys, "value": signature.value_type}
         threshold = {"metric": signature.metric_name, "value": signature.threshold}
 
         # FILTRE POUR ICMP TYPE 8
-        if signature.ip_proto == "0x01" and signature.icmpv4_type_block:
+        if signature.ip_proto == 1 and signature.icmpv4_type_block:
             flows['filter'] = f'icmptype={signature.icmpv4_type_block}'
         
         # Filtre pour SIP
@@ -165,6 +170,7 @@ class DDosDetector:
         except Exception as e:
             logger.error(f"Error configuring {signature.name}: {e}")
 
+    # Suppression des règles de blocage expirées (selon Config.BLOCK_TIME)
     async def cleanup_expired_blocks(self):
         """Nettoie périodiquement les règles expirées"""
         while True:
@@ -197,6 +203,7 @@ class DDosDetector:
 
             await asyncio.sleep(self.config.CLEANUP_INTERVAL)
 
+    # Vérification des évènements déclenchés par sFlow-RT (selon les seuils précédemment définis)
     async def poll_events(self):
         """Polling des événements sFlow-RT"""
         last_check = time.time()
@@ -231,9 +238,10 @@ class DDosDetector:
             
             await asyncio.sleep(self.config.POLL_INTERVAL)
 
+    # Vérification des évènements sFlow-RT pour éventuellement déclencher une mitigation
     async def _check_active_attacks(self):
-        """Vérification proactive des attaques actives"""
-        logger.debug("🔍 Proactive attack check...")
+        """Vérification active des attaques actives"""
+        logger.debug("🔍 Attacks active check...")
         
         for signature in self.attack_signatures.values():
             try:
@@ -301,6 +309,7 @@ class DDosDetector:
         except Exception as e:
             logger.error(f"Error processing event: {e}")
 
+    # Vérification que l'IP que l'on s'apprête à bloquer n'est pas celle d'un élément important du réseau
     def _is_protected_ip(self, ip: str) -> bool:
 
         if ip in self.config.CONTROLLER_IP:
@@ -312,7 +321,7 @@ class DDosDetector:
         return False
 
     def build_rules(self, signature: AttackSignature, src_ip: str, dst_ip: str):
-        """Construit les règles block + allow"""
+        """Construit les règles de blocage block et d'autorisation allow"""
 
         block_rule = {
             "dpid": self.config.TARGETED_SWITCH,
@@ -340,7 +349,7 @@ class DDosDetector:
         }
 
         # Ajouter les champs optionnels s'ils existent
-        if signature.ip_proto == "0x01":
+        if signature.ip_proto == 1:
             if signature.icmpv4_type_block:
                 block_rule["match"]["icmpv4_type"] = signature.icmpv4_type_block
                 block_rule["match"]["ipv4_src"] = src_ip
@@ -349,7 +358,7 @@ class DDosDetector:
                 allow_rule["match"]["ipv4_dst"] = dst_ip
             if signature.icmpv4_type_allow:
                 allow_rule["match"]["icmpv4_type"] = signature.icmpv4_type_allow
-        elif signature.ip_proto == "0x11" and signature.udp_dst:
+        elif signature.ip_proto == 17 and signature.udp_dst:
             block_rule["match"]["udp_dst"] = signature.udp_dst
             allow_rule["match"]["udp_src"] = signature.udp_dst
             block_rule["match"]["ipv4_src"] = src_ip
