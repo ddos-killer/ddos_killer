@@ -56,7 +56,7 @@ class DDosDetector:
                 keys="ipsource,ipdestination,udpdestinationport",
                 metric_name="sip_flood",
                 ip_proto=17,
-                threshold=30000,  # 50 kB/s de trafic SIP
+                threshold=15000,  # 50 kB/s de trafic SIP
                 udp_dst="5060",
                 bidirectional_block=False,
             ),
@@ -474,7 +474,7 @@ class DDosDetector:
                 f"{self.config.RYU_URL}/stats/flowentry/add",
                 data=json.dumps(block_rule),
             ) as resp:
-                result = await resp.text()
+                await resp.text()
                 logger.warning(
                     f"🚨 BLOCKED {src_ip} -> {dst_ip} ({signature.name}): {resp.status}"
                 )
@@ -495,7 +495,7 @@ class DDosDetector:
                     f"{self.config.RYU_URL}/stats/flowentry/add",
                     data=json.dumps(allow_rule),
                 ) as resp:
-                    result = await resp.text()
+                    await resp.text()
                     src = allow_rule['match']['ipv4_src']
                     dst = allow_rule['match']['ipv4_dst']
                     if signature.name == "ICMP Flood":
