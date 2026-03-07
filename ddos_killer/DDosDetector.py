@@ -145,7 +145,7 @@ class DDosDetector:
         flows = {"keys": signature.keys, "value": signature.value_type}
         threshold = {"metric": signature.metric_name, "value": signature.threshold}
 
-        # FILTRE POUR ICMP TYPE 8
+        # Filtre pour ICMP TYPE 8 (echo request)
         if signature.ip_proto == 1 and signature.icmpv4_type_block:
             flows['filter'] = f'icmptype={signature.icmpv4_type_block}'
         
@@ -155,12 +155,14 @@ class DDosDetector:
 
         try:
             logger.info(f"Configuring {signature.name}")
+            # Envoi des flows (règles de détection)
             async with self.session.put(
                 f"{self.config.SFLOW_RT_URL}/flow/{signature.metric_name}/json",
                 json=flows,
             ) as resp:
                 logger.info(f"{signature.name} flow configured: {resp.status}")
 
+            # Envoi des seuils de détection correspondant aux flows
             async with self.session.put(
                 f"{self.config.SFLOW_RT_URL}/threshold/{signature.metric_name}/json",
                 json=threshold,
@@ -177,15 +179,18 @@ class DDosDetector:
             try:
                 blacklist_size_before = len(self.blacklist)
                 logger.debug(f"🧹 Cleanup check... (blacklist: {blacklist_size_before} entries)")
-                
+
+                # Récupération de toutes les règles arrivées à expiration (délai défini dans la classe Config)                
                 expired = self.blacklist.get_expired()
 
                 if expired:
                     logger.info(f"♻️ Cleaning {len(expired)} expired rule(s)")
 
+                # Parcours de toutes les règles expirées de la blacklist
                 for flow_name, switch_id, match, src_ip, dst_ip in expired:
                     delete_data = {"dpid": int(switch_id), "match": match}
 
+                    # Ordre de suppression de la règle envoyé au contrôleur
                     async with self.session.post(
                         f"{self.config.RYU_URL}/stats/flowentry/delete",
                         json=delete_data,
@@ -212,6 +217,7 @@ class DDosDetector:
             try:
                 event_url = f'{self.config.SFLOW_RT_URL}/events/json?maxEvents=10&timeout=60&eventID={self.event_id}'
                 
+                # Récupération des évènements déclenchés par sFlow-RT via l'URL ci-dessus
                 async with self.session.get(event_url) as resp:
                     events = await resp.json()
                 
@@ -222,9 +228,10 @@ class DDosDetector:
                     logger.info(f"📬 Received {len(events)} event(s)")
                     for event in events:
                         logger.warning(f"🔔 Event: {event.get('metric')}")
+                        # Gestion usuelle des évènements (cas général)
                         await self._process_event(event)
                 
-                # ← POLLING ACTIF : vérifier les métriques régulièrement
+                # ← POLLING ACTIF : vérifier les métriques régulièrement, ce qui permet de bloquer une attaque déjà en cours (cas spécifique)
                 # même sans events
                 now = time.time()
                 if now - last_check > 10:  # Toutes les 10 secondes
@@ -272,7 +279,7 @@ class DDosDetector:
         """Traite un événement de détection"""
         metric_name = event.get("metric")
 
-        # Trouver la signature correspondante
+        # Trouver la signature correspondante parmi celles définies dans self.attack_signatures
         signature = next(
             (
                 sig
@@ -299,7 +306,7 @@ class DDosDetector:
 
             if metric.get("metricValue", 0) > signature.threshold and metric.get(
                 "topKeys"
-            ):
+            ): # Seuil dépassé
                 for top_key in metric["topKeys"]:
                     if top_key.get("value") and top_key.get("key"):
                         if top_key["value"] > signature.threshold:
@@ -323,6 +330,7 @@ class DDosDetector:
     def build_rules(self, signature: AttackSignature, src_ip: str, dst_ip: str):
         """Construit les règles de blocage block et d'autorisation allow"""
 
+        # Règle de blocage
         block_rule = {
             "dpid": self.config.TARGETED_SWITCH,
             "priority": self.config.FW_PRIORITY,
@@ -330,9 +338,10 @@ class DDosDetector:
                 "eth_type": 0x0800,
                 "ip_proto": signature.ip_proto,
             },
-            "actions": [],
+            "actions": [], # Interdiction (DROP) du trafic
         }
 
+        # Règle d'autorisation
         allow_rule = {
             "dpid": self.config.TARGETED_SWITCH,
             "priority": int(self.config.FW_PRIORITY) + 1,
@@ -342,14 +351,14 @@ class DDosDetector:
             },
             "actions": [
                 {
-                    "type": "OUTPUT",
+                    "type": "OUTPUT", # Autorisation du trafic
                     "port": "NORMAL",  # Ou port number
                 }
             ],
         }
 
         # Ajouter les champs optionnels s'ils existent
-        if signature.ip_proto == 1:
+        if signature.ip_proto == 1: # Blocage ICMP
             if signature.icmpv4_type_block:
                 block_rule["match"]["icmpv4_type"] = signature.icmpv4_type_block
                 block_rule["match"]["ipv4_src"] = src_ip
@@ -358,19 +367,17 @@ class DDosDetector:
                 allow_rule["match"]["ipv4_dst"] = dst_ip
             if signature.icmpv4_type_allow:
                 allow_rule["match"]["icmpv4_type"] = signature.icmpv4_type_allow
-        elif signature.ip_proto == 17 and signature.udp_dst:
+        elif signature.ip_proto == 17 and signature.udp_dst: # Blocage SIP (17 = UDP)
             block_rule["match"]["udp_dst"] = signature.udp_dst
             allow_rule["match"]["udp_src"] = signature.udp_dst
             block_rule["match"]["ipv4_src"] = src_ip
             block_rule["match"]["ipv4_dst"] = dst_ip
             allow_rule["match"]["ipv4_src"] = dst_ip
             allow_rule["match"]["ipv4_dst"] = src_ip
-        else:
+        else: # Cas générique si d'autre signatures sont ajoutés à la détection
             allow_rule = None
             block_rule["match"]["ipv4_src"] = src_ip
             block_rule["match"]["ipv4_dst"] = dst_ip
-        # if signature.tcp_flags:
-        #     block_rule["match"]["tcp_flags"] = signature.tcp_flags
 
         return block_rule, allow_rule
 
@@ -421,6 +428,7 @@ class DDosDetector:
             "actions": [{"type": "OUTPUT", "port": "NORMAL"}],
         }
 
+        # Envoi de toutes les règles
         for rule in [l2_forward, arp_allow, sflow_allow, openflow_allow]:
             try:
                 async with self.session.post(
@@ -449,16 +457,20 @@ class DDosDetector:
         src_ip = key_values.get('ipsource')
         dst_ip = key_values.get('ipdestination')
 
+        # Vérification qu'on ne tente pas de bloquer le contrôleur ou le switch
         if self._is_protected_ip(src_ip):
             logger.warning(f"Skipping protected IP: {src_ip}")
             return
         
+        # Vérification d'un éventuel blocage déjà actif (peu importe le sens)
         if self.blacklist.is_blocked(src_ip, dst_ip, signature.metric_name):
             logger.info(f"✋ {src_ip} ↔ {dst_ip} already blocked for {signature.name}")
             return
 
+        # Construction des règles
         block_rule, allow_rule = self.build_rules(signature, src_ip, dst_ip)
 
+        # Ajout à la liste des évènements passés pour vérification de la blacklist plus tard
         self.events.append(
             {
                 "timestamp": time.time(),
@@ -470,6 +482,7 @@ class DDosDetector:
         )
 
         try:
+            # Envoi de la règle de blocage
             async with self.session.post(
                 f"{self.config.RYU_URL}/stats/flowentry/add",
                 data=json.dumps(block_rule),
@@ -479,7 +492,7 @@ class DDosDetector:
                     f"🚨 BLOCKED {src_ip} -> {dst_ip} ({signature.name}): {resp.status}"
                 )
 
-            # Ajouter à la blacklist avec métadonnées
+            # Ajouter la règle à la blacklist
             self.blacklist.add(
                 flow_name=f"{signature.metric_name}_block_{src_ip}_{dst_ip}",
                 switch_id=str(self.config.TARGETED_SWITCH),
@@ -491,6 +504,7 @@ class DDosDetector:
             )
 
             if allow_rule:
+                # Envoi de la règle d'autorisation
                 async with self.session.post(
                     f"{self.config.RYU_URL}/stats/flowentry/add",
                     data=json.dumps(allow_rule),
@@ -506,7 +520,7 @@ class DDosDetector:
                         f"✅ ALLOWED {src} -> {dst} ({signature.name}): {resp.status}"
                     )
 
-                # Ajouter à la blacklist avec métadonnées
+                # Ajouter la règle à la blacklist
                 self.blacklist.add(
                     flow_name=f"{signature.metric_name}_allow_{dst_ip}_{src_ip}",
                     switch_id=str(self.config.TARGETED_SWITCH),
@@ -522,6 +536,8 @@ class DDosDetector:
 
     async def run(self):
         """Lance le détecteur avec toutes ses tâches"""
+        
+        # Vérification de l'état du contrôleur et de sFlow + configuration initiale de sFlow
         initialized = await self.initialize_detection()
 
         if not initialized:
@@ -530,7 +546,7 @@ class DDosDetector:
 
         logger.info("Engine started")
 
-        # Lancer les tâches en parallèle
+        # Lancer les tâches de gestion des évènements sFlow et de nettoyage de la blacklist en parallèle
         await asyncio.gather(
             self.poll_events(), self.cleanup_expired_blocks(), return_exceptions=True
         )
